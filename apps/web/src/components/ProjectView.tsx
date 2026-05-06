@@ -13,19 +13,25 @@ import {
   deletePreviewComment,
   fetchPreviewComments,
   fetchDesignSystem,
+  fetchLiveArtifacts,
   fetchProjectFiles,
   fetchSkill,
   patchPreviewCommentStatus,
   upsertPreviewComment,
   writeProjectTextFile,
 } from '../providers/registry';
+import { useProjectFileEvents, type ProjectEvent } from '../providers/project-events';
 import { composeSystemPrompt } from '@open-design/contracts';
 import { navigate } from '../router';
-import { agentDisplayName } from '../utils/agentLabels';
-import { apiProtocolAgentId, apiProtocolLabel } from '../utils/apiProtocol';
+import { agentDisplayName, agentModelDisplayName } from '../utils/agentLabels';
+import {
+  apiProtocolAgentId,
+  apiProtocolModelLabel,
+} from '../utils/apiProtocol';
 import { playSound, showCompletionNotification } from '../utils/notifications';
 import { DEFAULT_NOTIFICATIONS } from '../state/config';
 import type { TodoItem } from '../runtime/todos';
+import { isLiveArtifactTabId, liveArtifactTabId } from '../types';
 import {
   createConversation,
   deleteConversation as deleteConversationApi,
@@ -54,6 +60,8 @@ import type {
   PreviewCommentTarget,
   ProjectFile,
   ProjectTemplate,
+  LiveArtifactEventItem,
+  LiveArtifactSummary,
   SkillSummary,
 } from '../types';
 import {
@@ -65,6 +73,7 @@ import {
 import { AppChromeHeader } from './AppChromeHeader';
 import { AvatarMenu } from './AvatarMenu';
 import { ChatPane } from './ChatPane';
+import { decideAutoOpenAfterWrite } from './auto-open-file';
 import { FileWorkspace } from './FileWorkspace';
 
 interface Props {
@@ -93,6 +102,41 @@ interface Props {
   onTouchProject: () => void;
   onProjectChange: (next: Project) => void;
   onProjectsRefresh: () => void;
+}
+
+let liveArtifactEventSequence = 0;
+
+function appendLiveArtifactEventItem(
+  prev: LiveArtifactEventItem[],
+  event: LiveArtifactEventItem['event'],
+): LiveArtifactEventItem[] {
+  liveArtifactEventSequence += 1;
+  const next = [...prev, { id: liveArtifactEventSequence, event }];
+  return next.length > 50 ? next.slice(next.length - 50) : next;
+}
+
+function projectEventToAgentEvent(evt: ProjectEvent): LiveArtifactEventItem['event'] | null {
+  if (evt.type === 'file-changed') return null;
+  if (evt.type === 'live_artifact') {
+    return {
+      kind: 'live_artifact',
+      action: evt.action,
+      projectId: evt.projectId,
+      artifactId: evt.artifactId,
+      title: evt.title,
+      refreshStatus: evt.refreshStatus,
+    };
+  }
+  return {
+    kind: 'live_artifact_refresh',
+    phase: evt.phase,
+    projectId: evt.projectId,
+    artifactId: evt.artifactId,
+    refreshId: evt.refreshId,
+    title: evt.title,
+    refreshedSourceCount: evt.refreshedSourceCount,
+    error: evt.error,
+  };
 }
 
 export function ProjectView({
@@ -130,6 +174,8 @@ export function ProjectView({
   const [artifact, setArtifact] = useState<Artifact | null>(null);
   const [filesRefresh, setFilesRefresh] = useState(0);
   const [projectFiles, setProjectFiles] = useState<ProjectFile[]>([]);
+  const [liveArtifacts, setLiveArtifacts] = useState<LiveArtifactSummary[]>([]);
+  const [liveArtifactEvents, setLiveArtifactEvents] = useState<LiveArtifactEventItem[]>([]);
   // The persisted set of open tabs + active tab. Persisted via PUT on every
   // change; loaded once when the project mounts.
   const [openTabsState, setOpenTabsState] = useState<OpenTabsState>({
@@ -333,6 +379,17 @@ export function ProjectView({
     return next;
   }, [project.id]);
 
+  const refreshLiveArtifacts = useCallback(async (): Promise<LiveArtifactSummary[]> => {
+    const next = await fetchLiveArtifacts(project.id);
+    setLiveArtifacts(next);
+    return next;
+  }, [project.id]);
+
+  const refreshWorkspaceItems = useCallback(async (): Promise<ProjectFile[]> => {
+    const [nextFiles] = await Promise.all([refreshProjectFiles(), refreshLiveArtifacts()]);
+    return nextFiles;
+  }, [refreshLiveArtifacts, refreshProjectFiles]);
+
   const requestOpenFile = useCallback((name: string) => {
     if (!name) return;
     setOpenRequest({ name, nonce: Date.now() });
@@ -356,8 +413,25 @@ export function ProjectView({
   // agent has written anything still see the user's pasted images.
   useEffect(() => {
     if (!daemonLive) return;
-    void refreshProjectFiles();
-  }, [daemonLive, refreshProjectFiles, filesRefresh]);
+    void refreshWorkspaceItems();
+  }, [daemonLive, refreshWorkspaceItems, filesRefresh]);
+
+  // Live-reload: when the daemon's chokidar watcher reports a file change,
+  // bump filesRefresh so the file list refetches with new mtimes — which
+  // propagates through to FileViewer iframes via PR #384's ?v=${mtime}
+  // cache-bust, triggering an automatic preview reload without a click.
+  const handleProjectEvent = useCallback((evt: ProjectEvent) => {
+    if (evt.type === 'file-changed') {
+      setFilesRefresh((n) => n + 1);
+      return;
+    }
+    const agentEvent = projectEventToAgentEvent(evt);
+    if (!agentEvent) return;
+    setLiveArtifactEvents((prev) => appendLiveArtifactEventItem(prev, agentEvent));
+    void refreshLiveArtifacts();
+    onProjectsRefresh();
+  }, [onProjectsRefresh, refreshLiveArtifacts]);
+  useProjectFileEvents(project.id, daemonLive, handleProjectEvent);
 
   // When the URL points at a specific file, fire an open request so the
   // FileWorkspace promotes it to an active tab. We watch routeFileName
@@ -372,7 +446,9 @@ export function ProjectView({
   // history stack doesn't fill with every tab click.
   const lastSyncedFileRef = useRef<string | null>(null);
   useEffect(() => {
-    const target = openTabsState.active && projectFileNames.has(openTabsState.active)
+    const target = openTabsState.active && (
+      projectFileNames.has(openTabsState.active) || isLiveArtifactTabId(openTabsState.active)
+    )
       ? openTabsState.active
       : null;
     if (target === lastSyncedFileRef.current) return;
@@ -543,15 +619,19 @@ export function ProjectView({
   const patchAttachedStatuses = useCallback(
     async (attachments: ChatCommentAttachment[], status: PreviewComment['status']) => {
       if (!activeConversationId || attachments.length === 0) return;
+      const persistedAttachments = attachments.filter(
+        (attachment) => attachment.source !== 'board-batch',
+      );
+      if (persistedAttachments.length === 0) return;
       setPreviewComments((current) =>
         current.map((comment) =>
-          attachments.some((attachment) => attachment.id === comment.id)
+          persistedAttachments.some((attachment) => attachment.id === comment.id)
             ? { ...comment, status }
             : comment,
         ),
       );
       await Promise.all(
-        attachments.map((attachment) =>
+        persistedAttachments.map((attachment) =>
           patchPreviewCommentStatus(project.id, activeConversationId, attachment.id, status),
         ),
       );
@@ -767,6 +847,7 @@ export function ProjectView({
       commentAttachments: ChatCommentAttachment[] = commentsToAttachments(attachedComments),
     ) => {
       if (!activeConversationId) return;
+      if (streaming) return;
       if (!prompt.trim() && attachments.length === 0 && commentAttachments.length === 0) return;
       setError(null);
       const startedAt = Date.now();
@@ -782,14 +863,22 @@ export function ProjectView({
         config.mode === 'daemon' && config.agentId
           ? agentsById.get(config.agentId)
           : null;
+      const selectedAgentChoice =
+        config.mode === 'daemon' && config.agentId
+          ? config.agentModels?.[config.agentId]
+          : undefined;
       const assistantAgentId =
         config.mode === 'daemon'
           ? config.agentId ?? undefined
           : apiProtocolAgentId(config.apiProtocol);
       const assistantAgentName =
         config.mode === 'daemon'
-          ? assistantAgentDisplayName(config.agentId, selectedAgent?.name)
-          : apiProtocolLabel(config.apiProtocol);
+          ? agentModelDisplayName(
+              config.agentId,
+              selectedAgent?.name,
+              selectedAgentChoice?.model,
+            )
+          : apiProtocolModelLabel(config.apiProtocol, config.model);
       const assistantId = crypto.randomUUID();
       const assistantMsg: ChatMessage = {
         id: assistantId,
@@ -853,6 +942,21 @@ export function ProjectView({
       const pushEvent = (ev: AgentEvent) => {
         textBuffer.flush();
         updateAssistant((prev) => ({ ...prev, events: [...(prev.events ?? []), ev] }));
+        if (ev.kind === 'live_artifact') {
+          setLiveArtifactEvents((prev) => appendLiveArtifactEventItem(prev, ev));
+          void refreshLiveArtifacts().then(() => {
+            if (ev.action !== 'deleted') requestOpenFile(liveArtifactTabId(ev.artifactId));
+          });
+          onProjectsRefresh();
+          return;
+        }
+        if (ev.kind === 'live_artifact_refresh') {
+          setLiveArtifactEvents((prev) => appendLiveArtifactEventItem(prev, ev));
+          void refreshLiveArtifacts();
+          onProjectsRefresh();
+          return;
+        }
+        persistAssistantSoon();
         persistAssistantSoon();
         // Track Write tool invocations so we can auto-open the destination
         // file the moment the agent finishes writing it. The file-creating
@@ -861,19 +965,29 @@ export function ProjectView({
         if (ev.kind === 'tool_use' && (ev.name === 'Write' || ev.name === 'Edit')) {
           const filePath = (ev.input as { file_path?: unknown } | null)?.file_path;
           if (typeof filePath === 'string' && filePath.length > 0) {
-            const base = filePath.split('/').pop() || filePath;
-            pendingWritesRef.current.set(ev.id, base);
+            // Preserve the full path so decideAutoOpenAfterWrite can do a
+            // path-suffix match against the project's relative file paths.
+            // Reducing to a basename here would lose the segment alignment
+            // we need to disambiguate same-basename collisions across the
+            // project tree and outside it.
+            pendingWritesRef.current.set(ev.id, filePath);
           }
         }
         if (ev.kind === 'tool_result') {
-          const base = pendingWritesRef.current.get(ev.toolUseId);
-          if (base) {
+          const filePath = pendingWritesRef.current.get(ev.toolUseId);
+          if (filePath) {
             pendingWritesRef.current.delete(ev.toolUseId);
             if (!ev.isError) {
               // Refresh first so FileWorkspace's file list (and the tab
               // body) sees the new content before we ask it to focus.
-              void refreshProjectFiles().then(() => {
-                requestOpenFile(base);
+              // Only auto-open if the file actually landed in the project's
+              // file list — otherwise an out-of-project Write (e.g. an
+              // upstream repo edit) would spawn a permanent placeholder tab.
+              void refreshProjectFiles().then((nextFiles) => {
+                const decision = decideAutoOpenAfterWrite(filePath, nextFiles);
+                if (decision.shouldOpen && decision.fileName) {
+                  requestOpenFile(decision.fileName);
+                }
               });
             }
           }
@@ -1004,7 +1118,7 @@ export function ProjectView({
           handlers.onError(new Error('Pick a local agent first (top bar).'));
           return;
         }
-        const choice = config.agentModels?.[config.agentId];
+        const choice = selectedAgentChoice;
         void streamViaDaemon({
           agentId: config.agentId,
           history: nextHistory,
@@ -1057,6 +1171,7 @@ export function ProjectView({
     [
       attachedComments,
       activeConversationId,
+      streaming,
       messages,
       config,
       agentsById,
@@ -1065,12 +1180,22 @@ export function ProjectView({
       project.id,
       projectFiles,
       refreshProjectFiles,
+      refreshLiveArtifacts,
+      requestOpenFile,
       persistMessage,
       persistMessageById,
       patchAttachedStatuses,
       updateMessageById,
       onProjectsRefresh,
     ],
+  );
+
+  const handleSendBoardCommentAttachments = useCallback(
+    async (commentAttachments: ChatCommentAttachment[]) => {
+      if (streaming || commentAttachments.length === 0) return;
+      await handleSend('', [], commentAttachments);
+    },
+    [handleSend, streaming],
   );
 
   const persistArtifact = useCallback(
@@ -1398,22 +1523,29 @@ export function ProjectView({
           onAdoptPet={onAdoptPetInline}
           onTogglePet={onTogglePet}
           onOpenPetSettings={onOpenPetSettings}
+          projectMetadata={project.metadata}
+          onProjectMetadataChange={(metadata) => {
+            onProjectChange({ ...project, metadata });
+          }}
         />
         <FileWorkspace
           projectId={project.id}
           files={projectFiles}
+          liveArtifacts={liveArtifacts}
           onRefreshFiles={() => {
-            void refreshProjectFiles();
+            void refreshWorkspaceItems();
           }}
           isDeck={isDeck}
           onExportAsPptx={handleExportAsPptx}
           streaming={streaming}
           openRequest={openRequest}
+          liveArtifactEvents={liveArtifactEvents}
           tabsState={openTabsState}
           onTabsStateChange={persistTabsState}
           previewComments={previewComments}
           onSavePreviewComment={savePreviewComment}
           onRemovePreviewComment={removePreviewComment}
+          onSendBoardCommentAttachments={handleSendBoardCommentAttachments}
         />
       </div>
     </div>
